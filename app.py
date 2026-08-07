@@ -150,9 +150,17 @@ def inject_custom_css() -> None:
             font-weight: 600;
         }
 
-        [data-testid="stSidebar"] {
-            background-color: #14161f;
+        [data-testid="stSidebar"],
+        [data-testid="stSidebar"] > div,
+        [data-testid="stSidebarContent"] {
+            background-color: #14161f !important;
             border-right: 1px solid #262b3d;
+        }
+        [data-testid="stSidebar"] * {
+            color: #e4e6ee !important;
+        }
+        [data-testid="stSidebar"] hr {
+            border-color: #262b3d !important;
         }
 
         [data-testid="stExpander"] {
