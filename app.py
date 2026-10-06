@@ -5,7 +5,7 @@ Streamlit UI for the Multi-Agent AI system.
 
 RESPONSIBILITY OF THIS FILE:
 This file does NOT decide how the Solver/Reviewer loop works, does
-NOT talk to Ollama, and does NOT know how agents communicate. All of
+NOT talk to any LLM provider, and does NOT know how agents communicate. All of
 that lives in Orchestrator and below. This file's ONLY job is:
     1. Collect user input
     2. Call Orchestrator.run()
@@ -20,9 +20,31 @@ every element, so injecting raw CSS with unsafe_allow_html=True is the
 standard, accepted way to fully control appearance in a Streamlit app.
 """
 
+import os
+
 import streamlit as st
-from orchestrator import Orchestrator
-from config import MODEL_NAME, MAX_ITERATIONS
+
+# ---- Secrets bootstrap (must run BEFORE importing project modules) ----------
+# On Streamlit Community Cloud, API keys live in "Secrets". Copy them into
+# environment variables so config.py reads them the same way as a local .env.
+try:
+    for _key, _value in st.secrets.items():
+        if isinstance(_value, (str, int, float)) and _key not in os.environ:
+            os.environ[_key] = str(_value)
+except Exception:  # no secrets file locally -- that's fine, .env is used instead
+    pass
+
+from orchestrator import Orchestrator  # noqa: E402
+from llm import LLMError  # noqa: E402
+from config import (  # noqa: E402
+    MAX_ITERATIONS,
+    PROVIDERS,
+    GENERATOR_PROVIDERS,
+    REVIEWER_PROVIDERS,
+    SEARCH_ENABLED,
+    configured_providers,
+    tavily_key,
+)
 
 
 # ============================================================
@@ -211,21 +233,40 @@ def render_sidebar() -> None:
     """Render the sidebar: system info, settings, and controls."""
     with st.sidebar:
         st.markdown("### ⚙️ System Info")
-        st.markdown(f"**Model:** `{MODEL_NAME}`")
         st.markdown(f"**Max iterations:** `{MAX_ITERATIONS}`")
-        st.markdown("**Backend:** Local Ollama (no cloud API calls)")
+        st.markdown("**Backend:** Free hosted LLM APIs (no GPU, no local model)")
+
+        st.markdown("**Providers**")
+        ready = set(configured_providers())
+        for name, spec in PROVIDERS.items():
+            if name == "ollama":
+                continue
+            if name in ready:
+                st.markdown(f"🟢 `{name}` -- `{spec.model}`")
+            else:
+                st.markdown(f"⚪ `{name}` (no key)")
+        if SEARCH_ENABLED and tavily_key():
+            st.markdown("🟢 `web search` -- Tavily")
+        else:
+            st.markdown("⚪ `web search` (no TAVILY_API_KEY)")
+        st.caption(
+            f"Solver order: {' → '.join(p for p in GENERATOR_PROVIDERS if p in ready) or '--'}  \n"
+            f"Reviewer order: {' → '.join(p for p in REVIEWER_PROVIDERS if p in ready) or '--'}"
+        )
 
         st.divider()
 
         st.markdown("### 🔁 How it works")
         st.markdown(
-            "1. **Solver Agent** drafts an answer.\n"
-            "2. **Reviewer Agent** checks it for correctness, "
-            "completeness, and clarity.\n"
+            "0. **Planner** decides if the question needs fresh facts and, if so, "
+            "searches the web.\n"
+            "1. **Solver Agent** drafts an answer (citing the sources).\n"
+            "2. **Reviewer Agent** fact-checks it against those sources, and "
+            "for correctness, completeness, and clarity.\n"
             "3. If revision is needed, the Solver improves the draft "
             "and the Reviewer checks again.\n"
             "4. This repeats until the Reviewer approves, or the "
-            f"iteration limit ({MAX_ITERATIONS}) is reached.\n"
+            f"iteration limit ({MAX_ITERATIONS}) is reached (the best-scored draft wins).\n"
             "5. You only see the **final** answer -- the back-and-forth "
             "stays behind the scenes, but you can inspect it below "
             "each answer."
@@ -239,17 +280,26 @@ def render_sidebar() -> None:
 
         st.divider()
         st.caption(
-            "⚠️ This is a local, experimental multi-agent system built "
-            "from scratch in pure Python (no LangGraph/CrewAI/AutoGen). "
-            "Responses come from a small local model and may contain "
-            "mistakes -- always verify important information."
+            "⚠️ Experimental multi-agent system built in Python. Answers come from hosted "
+            "free-tier models and may contain mistakes -- always verify "
+            "important information."
         )
 
 
 # ============================================================
 # UI: A SINGLE CHAT TURN
 # ============================================================
-def render_assistant_turn(final_answer: str, approved: bool, iterations: int, history: list) -> None:
+def render_assistant_turn(
+    final_answer: str,
+    approved: bool,
+    iterations: int,
+    history: list,
+    best_score=None,
+    review_unavailable: bool = False,
+    mode: str = "general",
+    sources=None,
+    search_error=None,
+) -> None:
     """
     Render one assistant response block: answer, status badge,
     disclaimer, and a collapsible internal process trace.
@@ -261,18 +311,44 @@ def render_assistant_turn(final_answer: str, approved: bool, iterations: int, hi
     """
     st.write(final_answer)
 
+    score_txt = f" &nbsp;·&nbsp; score {best_score}/10" if best_score is not None else ""
     if approved:
         st.markdown(
             f'<span class="status-approved">✅ Approved by Reviewer</span> '
-            f'&nbsp;·&nbsp; {iterations} iteration(s)',
+            f'&nbsp;·&nbsp; {iterations} iteration(s){score_txt}',
+            unsafe_allow_html=True,
+        )
+    elif review_unavailable:
+        st.markdown(
+            '<span class="status-warning">⚠️ Reviewer unavailable (rate-limited) -- unreviewed answer</span>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
             f'<span class="status-warning">⚠️ Best effort -- max iterations reached</span> '
-            f'&nbsp;·&nbsp; {iterations} iteration(s)',
+            f'&nbsp;·&nbsp; {iterations} iteration(s){score_txt}',
             unsafe_allow_html=True,
         )
+
+    sources = sources or []
+    if mode == "grounded":
+        st.markdown(
+            f'<span class="status-approved">🔎 Grounded in {len(sources)} web source(s)</span>',
+            unsafe_allow_html=True,
+        )
+    elif mode == "unverified":
+        st.markdown(
+            '<span class="status-warning">⚠️ Live search unavailable -- answer avoids unverified '
+            'specifics (dates, prices, fixtures). Check official sources.</span>',
+            unsafe_allow_html=True,
+        )
+    if sources:
+        with st.expander(f"📚 Sources ({len(sources)})"):
+            for i, src in enumerate(sources, start=1):
+                st.markdown(f"**[{i}]** [{src['title']}]({src['url']})")
+                st.caption(src["snippet"][:300] + ("..." if len(src["snippet"]) > 300 else ""))
+    elif search_error and mode == "unverified":
+        st.caption(f"Search status: {search_error}")
 
     st.markdown(
         '<p class="ai-disclaimer">AI can make mistakes. Please verify important information.</p>',
@@ -281,7 +357,16 @@ def render_assistant_turn(final_answer: str, approved: bool, iterations: int, hi
 
     with st.expander("🔍 Show internal Solver ↔ Reviewer process"):
         for step in history:
-            st.markdown(f"**Iteration {step['iteration']}** -- Decision: `{step['decision']}`")
+            score = f" · score `{step['score']}/10`" if step.get("score") is not None else ""
+            st.markdown(f"**Iteration {step['iteration']}** -- Decision: `{step['decision']}`{score}")
+            solver, reviewer = step.get("solver") or {}, step.get("reviewer") or {}
+            if solver or reviewer:
+                st.caption(
+                    f"Solver: {solver.get('provider', '?')}/{solver.get('model', '?')} "
+                    f"({solver.get('latency_s', '?')}s)  ·  "
+                    f"Reviewer: {reviewer.get('provider', '?')}/{reviewer.get('model', '?')} "
+                    f"({reviewer.get('latency_s', '?')}s)"
+                )
             st.markdown("**Solver draft:**")
             st.info(step["draft"])
             st.markdown("**Reviewer response:**")
@@ -313,7 +398,9 @@ def render_chat_tab(orchestrator: Orchestrator) -> None:
             st.write(turn["question"])
         with st.chat_message("assistant", avatar="🤖"):
             render_assistant_turn(
-                turn["answer"], turn["approved"], turn["iterations"], turn["history"]
+                turn["answer"], turn["approved"], turn["iterations"], turn["history"],
+                turn.get("best_score"), turn.get("review_unavailable", False),
+                turn.get("mode", "general"), turn.get("sources"), turn.get("search_error"),
             )
 
     user_input = st.chat_input("Ask something...")
@@ -323,14 +410,40 @@ def render_chat_tab(orchestrator: Orchestrator) -> None:
             st.write(user_input)
 
         with st.chat_message("assistant", avatar="🤖"):
-            with st.spinner("Solver is drafting an answer, Reviewer is checking it..."):
-                result = orchestrator.run(user_input)
+            labels = {
+                "planning": "Planner is checking if fresh facts are needed...",
+                "searching": "Searching the web...",
+                "drafting": "Solver is drafting an answer...",
+                "reviewing": "Reviewer is checking round {iteration}...",
+                "revising": "Solver is revising (round {iteration})...",
+            }
+            try:
+                with st.status("Working...", expanded=False) as status:
+                    def on_event(stage: str, detail: dict) -> None:
+                        if stage in labels:
+                            status.update(label=labels[stage].format(**detail))
+
+                    result = orchestrator.run(user_input, on_event=on_event)
+                    status.update(label="Done", state="complete")
+            except LLMError as exc:
+                st.error(
+                    "All LLM providers failed or are rate-limited right now. "
+                    "Free tiers have per-minute limits -- wait a few seconds and retry."
+                )
+                with st.expander("Technical details"):
+                    st.code(str(exc))
+                return
 
             render_assistant_turn(
                 result["final_answer"],
                 result["approved"],
                 result["iterations_used"],
                 result["history"],
+                result["best_score"],
+                result["review_unavailable"],
+                result["mode"],
+                result["sources"],
+                result["search_error"],
             )
 
         st.session_state.chat_history.append({
@@ -339,6 +452,11 @@ def render_chat_tab(orchestrator: Orchestrator) -> None:
             "approved": result["approved"],
             "iterations": result["iterations_used"],
             "history": result["history"],
+            "best_score": result["best_score"],
+            "review_unavailable": result["review_unavailable"],
+            "mode": result["mode"],
+            "sources": result["sources"],
+            "search_error": result["search_error"],
         })
 
 
@@ -350,8 +468,7 @@ def render_about_tab() -> None:
     st.markdown("### 🏗️ Architecture")
     st.markdown(
         """
-This system is built entirely in **pure Python** -- no LangGraph, no CrewAI,
-no AutoGen -- to make the internal mechanics of a multi-agent AI workflow
+This system is built in **Python** with its own Solver/Reviewer orchestration layer, to make the internal mechanics of a multi-agent AI workflow
 fully transparent.
 
 ```
@@ -363,8 +480,11 @@ Streamlit UI  (app.py)
   ▼
 Orchestrator  (orchestrator.py)
   │
+  ├──▶ Planner ──▶ Tavily web search (only when facts can go stale)
+  │
   ├──▶ Solver Agent   ──┐
-  │                     ├──▶  LLMService  ──▶  Ollama (llama3.2:3b)
+  │                     ├──▶  LLMService  ──▶  Groq / Gemini / OpenRouter / Cerebras
+  │                     │      (free hosted APIs, automatic failover)
   └──▶ Reviewer Agent ──┘
 ```
 """
@@ -375,8 +495,17 @@ Orchestrator  (orchestrator.py)
         """
 - **Solver and Reviewer never call each other directly.** Only the
   Orchestrator coordinates them.
-- **Only `LLMService` talks to Ollama.** Agents never import the
-  `ollama` library directly -- this keeps the LLM backend swappable.
+- **Only `LLMService` talks to LLM providers.** Agents never import a
+  provider SDK -- keys, retries, rate-limit cooldowns and failover live
+  in one place, and any provider can be swapped via configuration.
+- **Writer and reviewer use different model families when possible**,
+  so the reviewer is a genuine second opinion, not a model grading itself.
+- **Grounded answers.** For time-sensitive questions (schedules, prices,
+  fixtures) the Solver may only state facts found in retrieved web sources,
+  and the Reviewer rejects any specific claim the sources do not support.
+  Without search, the agent says what it cannot verify instead of guessing.
+- **The Reviewer sees the original request**, and must return a score and
+  structured issues; an "approval" below the score threshold is rejected.
 - **The loop has a hard iteration limit**, so a stubborn Reviewer or a
   non-converging model can't loop forever.
 - **The user only ever sees the final answer.** All intermediate
@@ -387,7 +516,7 @@ Orchestrator  (orchestrator.py)
 
     st.info(
         "⚠️ **Disclaimer:** This is an educational/experimental project "
-        "running a small local model. It can produce incorrect, incomplete, "
+        "running on free-tier hosted models. It can produce incorrect, incomplete, "
         "or outdated information. Do not rely on it for medical, legal, "
         "financial, or safety-critical decisions."
     )
@@ -405,10 +534,10 @@ def main() -> None:
         <div class="app-header">
             <h1>🤖 Multi-Agent AI System</h1>
             <p>A Solver Agent and a Reviewer Agent iterate together until the answer
-            is approved -- running fully locally on Ollama.</p>
+            is approved -- powered by free hosted LLMs, no GPU needed.</p>
             <div class="badge-row">
-                <span class="badge">🧩 Pure Python -- no agent frameworks</span>
-                <span class="badge">🔒 Runs 100% locally</span>
+                <span class="badge">🔎 Web-grounded and fact-checked</span>
+                <span class="badge">☁️ Free remote LLMs -- zero local hardware</span>
                 <span class="badge">🔁 Iterative self-review</span>
             </div>
         </div>
@@ -417,6 +546,19 @@ def main() -> None:
     )
 
     render_sidebar()
+
+    if not configured_providers():
+        st.error("No LLM API key found.")
+        st.markdown(
+            "Add at least one **free** key (no credit card) as an environment variable, "
+            "a `.env` file, or Streamlit *Secrets*:\n\n"
+            "- `GROQ_API_KEY` -- https://console.groq.com/keys\n"
+            "- `GEMINI_API_KEY` -- https://aistudio.google.com/apikey\n"
+            "- `OPENROUTER_API_KEY` -- https://openrouter.ai/keys\n\n"
+            "Using two or more keys enables cross-model review and automatic failover."
+        )
+        st.stop()
+
     orchestrator = get_orchestrator()
 
     tab_chat, tab_about = st.tabs(["💬 Chat", "ℹ️ About This System"])
